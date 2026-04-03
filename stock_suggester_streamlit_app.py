@@ -1,5 +1,6 @@
 import math
 import os
+import time
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional, Tuple
@@ -89,15 +90,27 @@ class YFinanceProvider(MarketDataProvider):
             return {}
 
         all_symbols = list(dict.fromkeys(symbols + [benchmark]))
-        raw = yf.download(
-            tickers=all_symbols,
-            period=period,
-            interval=interval,
-            auto_adjust=False,
-            progress=False,
-            group_by="ticker",
-            threads=True,
-        )
+        
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                raw = yf.download(
+                    tickers=all_symbols,
+                    period=period,
+                    interval=interval,
+                    auto_adjust=False,
+                    progress=False,
+                    group_by="ticker",
+                    threads=True,
+                    timeout=30
+                )
+                break
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    return {}
+                time.sleep(2 ** attempt)  # Exponential backoff
+        else:
+            return {}
 
         result: Dict[str, pd.DataFrame] = {}
         if raw.empty:
@@ -118,9 +131,71 @@ class YFinanceProvider(MarketDataProvider):
         return result
 
 
-def get_provider(provider_type: str) -> MarketDataProvider:
+class AlphaVantageProvider(MarketDataProvider):
+    def __init__(self, api_key: str = 'demo'):
+        self.api_key = api_key
+
+    def get_historical_data(self, symbols: List[str], benchmark: str, period: str, interval: str) -> Dict[str, pd.DataFrame]:
+        all_symbols = list(dict.fromkeys(symbols + [benchmark]))
+        result = {}
+        
+        for symbol in all_symbols:
+            try:
+                if interval == '1d':
+                    function = 'TIME_SERIES_DAILY'
+                    url = f'https://www.alphavantage.co/query?function={function}&symbol={symbol}&apikey={self.api_key}&outputsize=full'
+                    time_key = 'Time Series (Daily)'
+                elif interval == '1h':
+                    function = 'TIME_SERIES_INTRADAY'
+                    url = f'https://www.alphavantage.co/query?function={function}&symbol={symbol}&interval=60min&apikey={self.api_key}&outputsize=full'
+                    time_key = 'Time Series (60min)'
+                else:
+                    continue  # not supported
+                
+                response = requests.get(url, timeout=30)
+                response.raise_for_status()
+                data = response.json()
+                
+                if time_key not in data:
+                    continue
+                
+                time_series = data[time_key]
+                df = pd.DataFrame.from_dict(time_series, orient='index')
+                df = df.rename(columns={
+                    '1. open': 'Open',
+                    '2. high': 'High', 
+                    '3. low': 'Low',
+                    '4. close': 'Close',
+                    '5. volume': 'Volume'
+                })
+                df.index = pd.to_datetime(df.index)
+                df = df.astype(float)
+                df = df.sort_index()
+                
+                # Filter by period
+                if period == '6mo':
+                    days = 126
+                elif period == '1y':
+                    days = 252
+                elif period == '2y':
+                    days = 504
+                else:
+                    days = 252  # default
+                
+                df = df.tail(days)
+                result[symbol] = df
+                
+            except Exception:
+                continue
+        
+        return result
+
+
+def get_provider(provider_type: str, api_key: str = 'demo') -> MarketDataProvider:
     if provider_type == 'YFINANCE':
         return YFinanceProvider()
+    elif provider_type == 'ALPHA_VANTAGE':
+        return AlphaVantageProvider(api_key if api_key else 'demo')
     else:
         raise ValueError(f"Unsupported provider: {provider_type}")
 
@@ -219,15 +294,15 @@ def get_status_text(score: float) -> str:
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def download_price_data(provider_type: str, symbols: Tuple[str, ...], benchmark: str, period: str, interval: str) -> Tuple[Dict[str, pd.DataFrame], str]:
-    provider = get_provider(provider_type)
+def download_price_data(provider_type: str, symbols: Tuple[str, ...], benchmark: str, period: str, interval: str, api_key: str = 'demo') -> Tuple[Dict[str, pd.DataFrame], str]:
+    provider = get_provider(provider_type, api_key)
     data = provider.get_historical_data(list(symbols), benchmark, period, interval)
     return data, 'live'
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def get_single_symbol_data(provider_type: str, symbol: str, period: str, interval: str) -> pd.DataFrame:
-    data, _ = download_price_data(provider_type, (symbol,), symbol, period, interval)
+def get_single_symbol_data(provider_type: str, symbol: str, period: str, interval: str, api_key: str = 'demo') -> pd.DataFrame:
+    data, _ = download_price_data(provider_type, (symbol,), symbol, period, interval, api_key)
     return data.get(symbol, pd.DataFrame())
 
 
@@ -414,8 +489,8 @@ def score_stock(symbol: str, df: pd.DataFrame, bench_df: pd.DataFrame, direction
     return max(candidates, key=lambda x: x.score)
 
 
-def build_suggestions(provider_type: str, symbols: List[str], benchmark: str, period: str, interval: str, direction_mode: str) -> Tuple[List[StockSuggestion], str, Dict[str, pd.DataFrame]]:
-    data, mode = download_price_data(provider_type, tuple(symbols), benchmark, period, interval)
+def build_suggestions(provider_type: str, symbols: List[str], benchmark: str, period: str, interval: str, direction_mode: str, api_key: str = 'demo') -> Tuple[List[StockSuggestion], str, Dict[str, pd.DataFrame]]:
+    data, mode = download_price_data(provider_type, tuple(symbols), benchmark, period, interval, api_key)
     if benchmark not in data:
         return [], mode, data
 
@@ -762,9 +837,10 @@ else:
         direction_options = ["Long Only", "Short Only", "Both"]
         direction_default = saved_settings.get("direction_mode", "Long Only")
         direction_mode = st.selectbox("Direction", direction_options, index=direction_options.index(direction_default) if direction_default in direction_options else 0)
-        provider_options = ["YFINANCE"]
+        provider_options = ["YFINANCE", "ALPHA_VANTAGE"]
         provider_default = saved_settings.get("provider", "YFINANCE")
         provider = st.selectbox("Data Provider", provider_options, index=provider_options.index(provider_default) if provider_default in provider_options else 0)
+        alpha_vantage_key = st.text_input("Alpha Vantage API Key (optional, uses demo if empty)", value=saved_settings.get("alpha_vantage_key", ""))
         top_n = st.slider("Show top candidates", min_value=1, max_value=10, value=int(saved_settings.get("top_n", 5)))
         show_score_chart = st.toggle("Show score chart", value=bool(saved_settings.get("show_score_chart", True)))
         show_breakdown_table = st.toggle("Show breakdown table", value=bool(saved_settings.get("show_breakdown_table", True)))
@@ -782,6 +858,7 @@ else:
                 "interval": interval,
                 "direction_mode": direction_mode,
                 "provider": provider,
+                "alpha_vantage_key": alpha_vantage_key,
                 "top_n": top_n,
                 "show_score_chart": show_score_chart,
                 "show_breakdown_table": show_breakdown_table,
@@ -798,7 +875,7 @@ else:
 
     if refresh or "suggestions" not in st.session_state:
         with st.spinner("Scanning market and ranking stocks..."):
-            all_results, data_mode, data = build_suggestions(provider, symbols, benchmark, period, interval, direction_mode)
+            all_results, data_mode, data = build_suggestions(provider, symbols, benchmark, period, interval, direction_mode, alpha_vantage_key)
             st.session_state["suggestions"] = [s for s in all_results if s.score >= preset_threshold] or all_results
             st.session_state["data_mode"] = data_mode
             st.session_state["data_info"] = {
@@ -846,7 +923,7 @@ else:
 
     if page == "Backtest":
         st.subheader("Backtest Snapshot")
-        bt_data, _ = download_price_data(provider, tuple([s.symbol for s in top_results]), benchmark, period, interval)
+        bt_data, _ = download_price_data(provider, tuple([s.symbol for s in top_results]), benchmark, period, interval, alpha_vantage_key)
         bt_df = backtest_suggestions(top_results, bt_data, lookahead_bars=10)
         if bt_df.empty:
             st.info("Not enough data to generate a quick backtest snapshot yet.")
@@ -875,6 +952,7 @@ else:
             "interval": interval,
             "direction_mode": direction_mode,
             "provider": provider,
+            "alpha_vantage_key": alpha_vantage_key,
             "top_n": top_n,
             "show_score_chart": show_score_chart,
             "show_breakdown_table": show_breakdown_table,
@@ -941,7 +1019,7 @@ else:
         f"""
         <div class="status-card">
             <strong>Data Provider Status:</strong><br>
-            Provider: {data_info.get('provider', 'Unknown')} | Mode: Live<br>
+            Provider: {data_info.get('provider', 'Unknown').replace('_', ' ').title()} | Mode: Live<br>
             Requested Symbols: {data_info.get('requested_symbols', 0)} | Data Available: {data_info.get('available_data', 0)} | Benchmark: {'Yes' if data_info.get('benchmark_available') else 'No'}
         </div>
         """,
@@ -1043,7 +1121,7 @@ else:
         mini_cols = st.columns(min(3, len(top_results)))
         for idx, s in enumerate(top_results[:3]):
             with mini_cols[idx]:
-                mini_df = get_single_symbol_data(provider, s.symbol, period, interval)
+                mini_df = get_single_symbol_data(provider, s.symbol, period, interval, alpha_vantage_key)
                 st.markdown(f"<div class='mini-chart-card'><strong>{s.symbol}</strong> <span class='score-chip'>Score {s.score}/100</span></div>", unsafe_allow_html=True)
                 if mini_df is not None and not mini_df.empty:
                     mini_source = mini_df.tail(30).reset_index()
@@ -1056,7 +1134,7 @@ else:
                     st.caption("No price data available.")
 
     st.subheader("Final Pick Decision Card")
-    price_df = get_single_symbol_data(provider, best.symbol, period, interval)
+    price_df = get_single_symbol_data(provider, best.symbol, period, interval, alpha_vantage_key)
     if price_df is not None and not price_df.empty and go is not None:
         chart_source = price_df.tail(60).reset_index()
         time_col = chart_source.columns[0]
