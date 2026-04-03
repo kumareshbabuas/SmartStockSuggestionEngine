@@ -1,5 +1,6 @@
 import math
 import os
+from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -74,6 +75,96 @@ if STREAMLIT_AVAILABLE:
         layout="wide",
         initial_sidebar_state="expanded",
     )
+
+
+class MarketDataProvider(ABC):
+    @abstractmethod
+    def get_historical_data(self, symbols: List[str], benchmark: str, period: str, interval: str) -> Dict[str, pd.DataFrame]:
+        pass
+
+
+class YFinanceProvider(MarketDataProvider):
+    def get_historical_data(self, symbols: List[str], benchmark: str, period: str, interval: str) -> Dict[str, pd.DataFrame]:
+        if yf is None:
+            return {}
+
+        all_symbols = list(dict.fromkeys(symbols + [benchmark]))
+        raw = yf.download(
+            tickers=all_symbols,
+            period=period,
+            interval=interval,
+            auto_adjust=False,
+            progress=False,
+            group_by="ticker",
+            threads=True,
+        )
+
+        result: Dict[str, pd.DataFrame] = {}
+        if raw.empty:
+            return result
+
+        if not isinstance(raw.columns, pd.MultiIndex):
+            df = raw.copy().dropna(how="all")
+            if not df.empty:
+                result[all_symbols[0]] = df
+            return result
+
+        for symbol in all_symbols:
+            if symbol in raw.columns.get_level_values(0):
+                df = raw[symbol].copy().dropna(how="all")
+                if not df.empty:
+                    result[symbol] = df
+
+        return result
+
+
+class DemoProvider(MarketDataProvider):
+    def __init__(self):
+        self.seed = 42
+        np.random.seed(self.seed)
+
+    def get_historical_data(self, symbols: List[str], benchmark: str, period: str, interval: str) -> Dict[str, pd.DataFrame]:
+        # Generate deterministic demo data for symbols and benchmark
+        all_symbols = list(dict.fromkeys(symbols + [benchmark]))
+        result = {}
+        # Generate ~252 trading days of data
+        num_days = 252
+        dates = pd.date_range(end=pd.Timestamp.now(), periods=num_days, freq='D')
+
+        for symbol in all_symbols:
+            # Generate synthetic OHLCV with realistic volatility
+            base_price = np.random.uniform(100, 1000)
+            prices = [base_price]
+            for _ in range(num_days - 1):
+                change = np.random.normal(0, 0.015)  # ~1.5% daily volatility
+                new_price = max(prices[-1] * (1 + change), 1)  # Prevent negative prices
+                prices.append(new_price)
+
+            closes = np.array(prices)
+            highs = closes * (1 + np.abs(np.random.normal(0, 0.02, num_days)))
+            lows = closes * (1 - np.abs(np.random.normal(0, 0.02, num_days)))
+            opens = closes * (1 + np.random.normal(0, 0.005, num_days))
+            volumes = np.random.randint(100000, 10000000, num_days)
+
+            df = pd.DataFrame({
+                'Open': opens,
+                'High': highs,
+                'Low': lows,
+                'Close': closes,
+                'Volume': volumes
+            }, index=dates)
+            result[symbol] = df
+
+        return result
+
+
+def get_provider(provider_type: str) -> MarketDataProvider:
+    if provider_type == 'YFINANCE':
+        return YFinanceProvider()
+    elif provider_type == 'DEMO':
+        return DemoProvider()
+    else:
+        return DemoProvider()  # Safe fallback
 
 
 @dataclass
@@ -170,43 +261,28 @@ def get_status_text(score: float) -> str:
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def download_price_data(symbols: Tuple[str, ...], benchmark: str, period: str, interval: str) -> Dict[str, pd.DataFrame]:
-    if yf is None:
-        return {}
-
-    all_symbols = list(dict.fromkeys(list(symbols) + [benchmark]))
-    raw = yf.download(
-        tickers=all_symbols,
-        period=period,
-        interval=interval,
-        auto_adjust=False,
-        progress=False,
-        group_by="ticker",
-        threads=True,
-    )
-
-    result: Dict[str, pd.DataFrame] = {}
-    if raw.empty:
-        return result
-
-    if not isinstance(raw.columns, pd.MultiIndex):
-        df = raw.copy().dropna(how="all")
-        if not df.empty:
-            result[all_symbols[0]] = df
-        return result
-
-    for symbol in all_symbols:
-        if symbol in raw.columns.get_level_values(0):
-            df = raw[symbol].copy().dropna(how="all")
-            if not df.empty:
-                result[symbol] = df
-
-    return result
+def download_price_data(provider_type: str, symbols: Tuple[str, ...], benchmark: str, period: str, interval: str) -> Tuple[Dict[str, pd.DataFrame], str]:
+    provider = get_provider(provider_type)
+    try:
+        data = provider.get_historical_data(list(symbols), benchmark, period, interval)
+        if data and all(not df.empty for df in data.values()):
+            mode = 'live'
+        else:
+            # Fallback to demo if live data is empty
+            demo_provider = DemoProvider()
+            data = demo_provider.get_historical_data(list(symbols), benchmark, period, interval)
+            mode = 'demo'
+    except Exception as e:
+        # Fallback to demo on any error
+        demo_provider = DemoProvider()
+        data = demo_provider.get_historical_data(list(symbols), benchmark, period, interval)
+        mode = 'demo'
+    return data, mode
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def get_single_symbol_data(symbol: str, period: str, interval: str) -> pd.DataFrame:
-    data = download_price_data((symbol,), benchmark=symbol, period=period, interval=interval)
+def get_single_symbol_data(provider_type: str, symbol: str, period: str, interval: str) -> pd.DataFrame:
+    data, _ = download_price_data(provider_type, (symbol,), symbol, period, interval)
     return data.get(symbol, pd.DataFrame())
 
 
@@ -393,10 +469,10 @@ def score_stock(symbol: str, df: pd.DataFrame, bench_df: pd.DataFrame, direction
     return max(candidates, key=lambda x: x.score)
 
 
-def build_suggestions(symbols: List[str], benchmark: str, period: str, interval: str, direction_mode: str) -> List[StockSuggestion]:
-    data = download_price_data(tuple(symbols), benchmark, period, interval)
+def build_suggestions(provider_type: str, symbols: List[str], benchmark: str, period: str, interval: str, direction_mode: str) -> Tuple[List[StockSuggestion], str, Dict[str, pd.DataFrame]]:
+    data, mode = download_price_data(provider_type, tuple(symbols), benchmark, period, interval)
     if benchmark not in data:
-        return []
+        return [], mode, data
 
     bench_df = data[benchmark]
     results: List[StockSuggestion] = []
@@ -409,7 +485,7 @@ def build_suggestions(symbols: List[str], benchmark: str, period: str, interval:
             results.append(suggestion)
 
     results.sort(key=lambda x: x.score, reverse=True)
-    return results
+    return results, mode, data
 
 
 def build_whatsapp_message(best: StockSuggestion, capital: float = 200000, risk_pct: float = 1.0) -> str:
@@ -644,6 +720,16 @@ else:
             box-shadow: 0 10px 24px rgba(15, 23, 42, 0.18);
             margin-bottom: 1rem;
         }
+        .status-card {
+            padding: 0.8rem 1rem;
+            border-radius: 12px;
+            background: rgba(255,255,255,0.9);
+            border: 1px solid rgba(148,163,184,0.3);
+            box-shadow: 0 4px 12px rgba(15, 23, 42, 0.05);
+            margin-bottom: 1rem;
+            font-size: 0.9rem;
+            color: #374151;
+        }
         .pill {
             display: inline-block;
             padding: 0.25rem 0.65rem;
@@ -731,6 +817,9 @@ else:
         direction_options = ["Long Only", "Short Only", "Both"]
         direction_default = saved_settings.get("direction_mode", "Long Only")
         direction_mode = st.selectbox("Direction", direction_options, index=direction_options.index(direction_default) if direction_default in direction_options else 0)
+        provider_options = ["YFINANCE", "DEMO"]
+        provider_default = saved_settings.get("provider", "YFINANCE")
+        provider = st.selectbox("Data Provider", provider_options, index=provider_options.index(provider_default) if provider_default in provider_options else 0)
         top_n = st.slider("Show top candidates", min_value=1, max_value=10, value=int(saved_settings.get("top_n", 5)))
         show_score_chart = st.toggle("Show score chart", value=bool(saved_settings.get("show_score_chart", True)))
         show_breakdown_table = st.toggle("Show breakdown table", value=bool(saved_settings.get("show_breakdown_table", True)))
@@ -747,6 +836,7 @@ else:
                 "period": period,
                 "interval": interval,
                 "direction_mode": direction_mode,
+                "provider": provider,
                 "top_n": top_n,
                 "show_score_chart": show_score_chart,
                 "show_breakdown_table": show_breakdown_table,
@@ -763,8 +853,16 @@ else:
 
     if refresh or "suggestions" not in st.session_state:
         with st.spinner("Scanning market and ranking stocks..."):
-            all_results = build_suggestions(symbols, benchmark, period, interval, direction_mode)
+            all_results, data_mode, data = build_suggestions(provider, symbols, benchmark, period, interval, direction_mode)
             st.session_state["suggestions"] = [s for s in all_results if s.score >= preset_threshold] or all_results
+            st.session_state["data_mode"] = data_mode
+            st.session_state["data_info"] = {
+                "provider": provider,
+                "mode": data_mode,
+                "requested_symbols": len(symbols),
+                "available_data": len(data),
+                "benchmark_available": benchmark in data
+            }
 
     suggestions: List[StockSuggestion] = st.session_state.get("suggestions", [])
     if not suggestions:
@@ -775,6 +873,7 @@ else:
     best = suggestions[0]
     top_results = suggestions[:top_n]
     status_text = get_status_text(best.score)
+    data_info = st.session_state.get("data_info", {})
 
     if auto_refresh:
         st.caption("Auto refresh is enabled. Refreshing in Streamlit normally requires an additional helper package or browser refresh.")
@@ -798,7 +897,7 @@ else:
 
     if page == "Backtest":
         st.subheader("Backtest Snapshot")
-        bt_data = download_price_data(tuple([s.symbol for s in top_results]), benchmark, period, interval)
+        bt_data, _ = download_price_data(provider, tuple([s.symbol for s in top_results]), benchmark, period, interval)
         bt_df = backtest_suggestions(top_results, bt_data, lookahead_bars=10)
         if bt_df.empty:
             st.info("Not enough data to generate a quick backtest snapshot yet.")
@@ -826,6 +925,7 @@ else:
             "period": period,
             "interval": interval,
             "direction_mode": direction_mode,
+            "provider": provider,
             "top_n": top_n,
             "show_score_chart": show_score_chart,
             "show_breakdown_table": show_breakdown_table,
@@ -887,6 +987,17 @@ else:
         st.metric("Stop Loss", f"₹{best.stop_loss:,.2f}")
     with col5:
         st.metric("Target", f"₹{best.target:,.2f}")
+
+    st.markdown(
+        f"""
+        <div class="status-card">
+            <strong>Data Provider Status:</strong><br>
+            Provider: {data_info.get('provider', 'Unknown')} | Mode: {data_info.get('mode', 'unknown').title()}<br>
+            Requested Symbols: {data_info.get('requested_symbols', 0)} | Data Available: {data_info.get('available_data', 0)} | Benchmark: {'Yes' if data_info.get('benchmark_available') else 'No'}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
     col_a, col_b = st.columns([1.2, 1])
     with col_a:
@@ -983,7 +1094,7 @@ else:
         mini_cols = st.columns(min(3, len(top_results)))
         for idx, s in enumerate(top_results[:3]):
             with mini_cols[idx]:
-                mini_df = get_single_symbol_data(s.symbol, period, interval)
+                mini_df = get_single_symbol_data(provider, s.symbol, period, interval)
                 st.markdown(f"<div class='mini-chart-card'><strong>{s.symbol}</strong> <span class='score-chip'>Score {s.score}/100</span></div>", unsafe_allow_html=True)
                 if mini_df is not None and not mini_df.empty:
                     mini_source = mini_df.tail(30).reset_index()
@@ -996,7 +1107,7 @@ else:
                     st.caption("No price data available.")
 
     st.subheader("Final Pick Decision Card")
-    price_df = get_single_symbol_data(best.symbol, period, interval)
+    price_df = get_single_symbol_data(provider, best.symbol, period, interval)
     if price_df is not None and not price_df.empty and go is not None:
         chart_source = price_df.tail(60).reset_index()
         time_col = chart_source.columns[0]
