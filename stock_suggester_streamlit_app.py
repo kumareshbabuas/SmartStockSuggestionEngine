@@ -810,8 +810,12 @@ else:
             }
 
     suggestions: List[StockSuggestion] = st.session_state.get("suggestions", [])
+    data_info = st.session_state.get("data_info", {})
     if not suggestions:
-        st.warning("No trade-ready stocks found for the current rules. Try switching interval, direction, or stock universe.")
+        if data_info.get('available_data', 0) == 0:
+            st.error("Unable to fetch market data from Yahoo Finance. Please check your internet connection and try again later.")
+        else:
+            st.warning("No trade-ready stocks found for the current rules. Try switching to 'Aggressive' preset, changing direction mode, or adjusting the stock universe.")
         st.stop()
 
     history_df = load_history()
