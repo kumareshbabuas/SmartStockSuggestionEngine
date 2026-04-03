@@ -118,53 +118,11 @@ class YFinanceProvider(MarketDataProvider):
         return result
 
 
-class DemoProvider(MarketDataProvider):
-    def __init__(self):
-        self.seed = 42
-        np.random.seed(self.seed)
-
-    def get_historical_data(self, symbols: List[str], benchmark: str, period: str, interval: str) -> Dict[str, pd.DataFrame]:
-        # Generate deterministic demo data for symbols and benchmark
-        all_symbols = list(dict.fromkeys(symbols + [benchmark]))
-        result = {}
-        # Generate ~252 trading days of data
-        num_days = 252
-        dates = pd.date_range(end=pd.Timestamp.now(), periods=num_days, freq='D')
-
-        for symbol in all_symbols:
-            # Generate synthetic OHLCV with realistic volatility
-            base_price = np.random.uniform(100, 1000)
-            prices = [base_price]
-            for _ in range(num_days - 1):
-                change = np.random.normal(0, 0.015)  # ~1.5% daily volatility
-                new_price = max(prices[-1] * (1 + change), 1)  # Prevent negative prices
-                prices.append(new_price)
-
-            closes = np.array(prices)
-            highs = closes * (1 + np.abs(np.random.normal(0, 0.02, num_days)))
-            lows = closes * (1 - np.abs(np.random.normal(0, 0.02, num_days)))
-            opens = closes * (1 + np.random.normal(0, 0.005, num_days))
-            volumes = np.random.randint(100000, 10000000, num_days)
-
-            df = pd.DataFrame({
-                'Open': opens,
-                'High': highs,
-                'Low': lows,
-                'Close': closes,
-                'Volume': volumes
-            }, index=dates)
-            result[symbol] = df
-
-        return result
-
-
 def get_provider(provider_type: str) -> MarketDataProvider:
     if provider_type == 'YFINANCE':
         return YFinanceProvider()
-    elif provider_type == 'DEMO':
-        return DemoProvider()
     else:
-        return DemoProvider()  # Safe fallback
+        raise ValueError(f"Unsupported provider: {provider_type}")
 
 
 @dataclass
@@ -263,21 +221,8 @@ def get_status_text(score: float) -> str:
 @st.cache_data(ttl=3600, show_spinner=False)
 def download_price_data(provider_type: str, symbols: Tuple[str, ...], benchmark: str, period: str, interval: str) -> Tuple[Dict[str, pd.DataFrame], str]:
     provider = get_provider(provider_type)
-    try:
-        data = provider.get_historical_data(list(symbols), benchmark, period, interval)
-        if data and all(not df.empty for df in data.values()):
-            mode = 'live'
-        else:
-            # Fallback to demo if live data is empty
-            demo_provider = DemoProvider()
-            data = demo_provider.get_historical_data(list(symbols), benchmark, period, interval)
-            mode = 'demo'
-    except Exception as e:
-        # Fallback to demo on any error
-        demo_provider = DemoProvider()
-        data = demo_provider.get_historical_data(list(symbols), benchmark, period, interval)
-        mode = 'demo'
-    return data, mode
+    data = provider.get_historical_data(list(symbols), benchmark, period, interval)
+    return data, 'live'
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -817,7 +762,7 @@ else:
         direction_options = ["Long Only", "Short Only", "Both"]
         direction_default = saved_settings.get("direction_mode", "Long Only")
         direction_mode = st.selectbox("Direction", direction_options, index=direction_options.index(direction_default) if direction_default in direction_options else 0)
-        provider_options = ["YFINANCE", "DEMO"]
+        provider_options = ["YFINANCE"]
         provider_default = saved_settings.get("provider", "YFINANCE")
         provider = st.selectbox("Data Provider", provider_options, index=provider_options.index(provider_default) if provider_default in provider_options else 0)
         top_n = st.slider("Show top candidates", min_value=1, max_value=10, value=int(saved_settings.get("top_n", 5)))
@@ -992,7 +937,7 @@ else:
         f"""
         <div class="status-card">
             <strong>Data Provider Status:</strong><br>
-            Provider: {data_info.get('provider', 'Unknown')} | Mode: {data_info.get('mode', 'unknown').title()}<br>
+            Provider: {data_info.get('provider', 'Unknown')} | Mode: Live<br>
             Requested Symbols: {data_info.get('requested_symbols', 0)} | Data Available: {data_info.get('available_data', 0)} | Benchmark: {'Yes' if data_info.get('benchmark_available') else 'No'}
         </div>
         """,
